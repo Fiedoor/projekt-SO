@@ -85,11 +85,11 @@ CMakeFiles/projektSO.dir/main.c.o: \
  /usr/include/x86_64-linux-gnu/bits/sigthread.h \
  /usr/include/x86_64-linux-gnu/bits/signal_ext.h \
  /usr/include/x86_64-linux-gnu/bits/types/idtype_t.h \
+ /usr/include/x86_64-linux-gnu/sys/shm.h \
  /usr/include/x86_64-linux-gnu/sys/ipc.h \
  /usr/include/x86_64-linux-gnu/bits/ipctypes.h \
  /usr/include/x86_64-linux-gnu/bits/ipc.h \
  /usr/include/x86_64-linux-gnu/bits/ipc-perm.h \
- /usr/include/x86_64-linux-gnu/sys/shm.h \
  /usr/include/x86_64-linux-gnu/bits/shm.h \
  /usr/include/x86_64-linux-gnu/bits/shmlba.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_shmid_ds.h \
@@ -98,6 +98,10 @@ CMakeFiles/projektSO.dir/main.c.o: \
  /usr/include/x86_64-linux-gnu/bits/sem.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_semid_ds.h \
  /usr/include/x86_64-linux-gnu/bits/types/struct_semid64_ds.h \
+ /usr/include/x86_64-linux-gnu/sys/msg.h \
+ /usr/include/x86_64-linux-gnu/bits/msq.h \
+ /usr/include/x86_64-linux-gnu/bits/types/struct_msqid_ds.h \
+ /usr/include/x86_64-linux-gnu/bits/types/struct_msqid64_ds.h \
  /usr/include/errno.h /usr/include/x86_64-linux-gnu/bits/errno.h \
  /usr/include/linux/errno.h /usr/lib/linux/uapi/x86/asm/errno.h \
  /usr/include/asm-generic/errno.h /usr/include/asm-generic/errno-base.h

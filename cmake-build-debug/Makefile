@@ -136,6 +136,43 @@ projektSO/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/projektSO.dir/build.make CMakeFiles/projektSO.dir/build
 .PHONY : projektSO/fast
 
+#=============================================================================
+# Target rules for targets named generator
+
+# Build rule for target.
+generator: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 generator
+.PHONY : generator
+
+# fast build rule for target.
+generator/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/generator.dir/build.make CMakeFiles/generator.dir/build
+.PHONY : generator/fast
+
+generator-pliku.o: generator-pliku.c.o
+.PHONY : generator-pliku.o
+
+# target to build an object file
+generator-pliku.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/generator.dir/build.make CMakeFiles/generator.dir/generator-pliku.c.o
+.PHONY : generator-pliku.c.o
+
+generator-pliku.i: generator-pliku.c.i
+.PHONY : generator-pliku.i
+
+# target to preprocess a source file
+generator-pliku.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/generator.dir/build.make CMakeFiles/generator.dir/generator-pliku.c.i
+.PHONY : generator-pliku.c.i
+
+generator-pliku.s: generator-pliku.c.s
+.PHONY : generator-pliku.s
+
+# target to generate assembly for a file
+generator-pliku.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/generator.dir/build.make CMakeFiles/generator.dir/generator-pliku.c.s
+.PHONY : generator-pliku.c.s
+
 main.o: main.c.o
 .PHONY : main.o
 
@@ -169,7 +206,11 @@ help:
 	@echo "... codegen"
 	@echo "... edit_cache"
 	@echo "... rebuild_cache"
+	@echo "... generator"
 	@echo "... projektSO"
+	@echo "... generator-pliku.o"
+	@echo "... generator-pliku.i"
+	@echo "... generator-pliku.s"
 	@echo "... main.o"
 	@echo "... main.i"
 	@echo "... main.s"

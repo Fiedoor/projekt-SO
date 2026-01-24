@@ -1,234 +1,250 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
+#include <stdio.h> //dpowiada za standardowe wejście i wyjście
+#include <stdlib.h> //Zawiera funkcje ogólne, takie jak exit() (kończenie procesu) czy malloc (zarządzanie pamięcią).
+#include <unistd.h> //zawiera kluczowe funkcje systemowe: fork() (tworzenie P1, P2, P3 ), pipe() (łącza), read/write (obsługa FIFO i PIPE) oraz close
+#include <sys/types.h> //(((definiują typy danych używane przez system (np. pid_t) oraz funkcje do sprawdzania statusu plików i tworzenia ich, jak mkfifo.
+#include <sys/stat.h> //)))
+#include <fcntl.h> //(File Control) Służy do kontrolowania deskryptorów plików. Dzięki niej możesz otwierać pliki i rury w konkretnych trybach, np. O_RDONLY (tylko odczyt) lub O_WRONLY (tylko zapis).
 #include <string.h>
-#include <sys/wait.h>
-#include <sys/ipc.h>
-#include <sys/shm.h>
-#include <sys/sem.h>
-#include <errno.h>
-#include <signal.h>
-
-// === KONFIGURACJA ===
+#include <sys/wait.h> //Pozwala Procesowi Macierzystemu (PM) czekać na zakończenie pracy swoich dzieci (P1, P2, P3), aby uniknąć "procesów zombie"
+//#include <sys/ipc.h> //Zawiera ogólne definicje dla mechanizmów komunikacji międzyprocesowej (Inter-Process Communication). Pozwala generować unikalne klucze dla zasobów.
+#include <sys/shm.h> //obsługa Pamięci Współdzielonej (Shared Memory). Umożliwia P2 i P1 dostęp do tego samego obszaru RAM
+#include <sys/sem.h> //Obsługa Semaforów. Pozwalają one synchronizować dostęp do pamięci, by P1 nie czytał danych, których P2 jeszcze nie zdążył zapisać.
+#include <sys/msg.h> //Obsługa Kolejek Komunikatów. To w nich Proces Macierzysty zapisuje wartości sygnałów, które potem odczytują P3, P2 i P1.
+#include <errno.h> //systemowa biblioteka do obsługi błędów. Jeśli np. mkfifo się nie uda, errno powie Ci dokładnie, czy problemem był brak uprawnień, czy to, że plik już istnieje.
+#include <signal.h> //Odpowiada za obsługę Sygnałów (np. SIGUSR1, SIGTERM). Pozwala procesom "pukać do siebie nawzajem" i informować o stanie.
+//DYREKTYWY
 #define NAZWA_FIFO "kolejka_fifo"
 #define ROZMIAR_BUFORA 256
-// Unikalne klucze dla zasobów systemowych
-#define KLUCZ_SHM 12345
-#define KLUCZ_SEM 67890
+#define KLUCZ_SHM 12345 //To jak numer szafki na basenie. - WSPÓLNA PAMIEC DLA KILKU ROCESÓW
+#define KLUCZ_SEM 67890 //To identyfikator zestawu "świateł drogowych" - SEMAFORY - STEROWANIE PROCESAMI
+#define KLUCZ_MSG 54321 //To identyfikator skrzynki pocztowej - SYGNAŁY - KONTROLA CO SIE DZIEJE PRZEKAZ INFORMACJI
 
-// === ZMIENNE GLOBALNE (dla obsługi sygnałów) ===
-int g_shm_id = -1;
-int g_sem_id = -1;
-int g_fifo_fd = -1;
-
-// Struktura przekazywana przez Pamięć Współdzieloną
-struct WspolnaPamiec {
-    char tekst[ROZMIAR_BUFORA];
-    int ilosc_bajtow; // P2 to oblicza, P1 wyświetla
-    int czy_koniec;   // Flaga zakończenia transmisji
+struct WspolnaPamiec { //(Biurko P2 i P1)
+    char tekst[ROZMIAR_BUFORA]; //P2 wpisuje tu to, co odebrał z FIFO.
+    int ilosc_bajtow; //To miejsce na wynik pracy procesu P2. P2 liczy znaki (strlen) i wpisuje liczbę tutaj. P1 stąd ją odczytuje.
+    int czy_koniec; //To tzw. "flaga". Działa jak włącznik światła.
 };
 
-// === OBSŁUGA SYGNAŁÓW (CLEANUP) ===
-// Ta funkcja uruchomi się, gdy wciśniesz Ctrl+C
-void obsluga_sygnalu(int sig) {
-    printf("\n\n[SYSTEM]: Otrzymano Ctrl+C (Sygnał %d). Sprzątam bałagan...\n", sig);
+struct Komunikat {//koperta dla komunikatow
+    long mtype; // <--- TO JEST KOPERTA (wymagane przez system)
+    int wartosc_sygnalu; // <--- TO JEST LIST (Twoje dane)
+};
 
-    // 1. Usuwamy Pamięć Współdzieloną
-    if (g_shm_id != -1) {
-        shmctl(g_shm_id, IPC_RMID, NULL);
-        printf("[SYSTEM]: Pamięć SHM usunięta.\n");
+int shm_id; //ID Pamięci Współdzielonej
+int sem_id; // ID Semaforów
+int msg_id; // ID Kolejki Komunikatów
+pid_t p1, p2, p3; // Numery procesów (Process ID)
+
+// --- SEMAFORY ---
+void sem_p(int s_id, int s_num) {
+    // Tworzymy strukturę operacji
+    // s_num: numer semafora (0 lub 1)
+    // -1:    operacja odejmowania (chcę wziąć zasób)
+    // 0:     flagi (standardowe zachowanie)
+    struct sembuf op = {s_num, -1, 0};
+    while (semop(s_id, &op, 1) == -1) if (errno != EINTR) break;
+    // Jeśli semop zwrócił błąd (-1), sprawdzamy dlaczego.
+    // EINTR oznacza "Interrupted System Call" - przerwanie przez sygnał.
+    // W Twoim projekcie latają sygnały SIGUSR1. One przerywają czekanie na semaforze.
+    // Jeśli to nie był sygnał (tylko np. błąd pamięci), to przerywamy pętlę (break).
+}
+
+void sem_v(int s_id, int s_num) {
+    // 1: operacja dodawania     (oddaję zasób, zwiększam licznik)
+    struct sembuf op = {s_num, 1, 0};
+    // To samo zabezpieczenie przed przerwaniem przez sygnał
+    while (semop(s_id, &op, 1) == -1) if (errno != EINTR) break;
+}
+
+// --- ZAAWANSOWANA OBSŁUGA SYGNAŁÓW ---
+void send_status(int target_pid, int signal_val) {
+    struct Komunikat m = {1, signal_val};
+    msgsnd(msg_id, &m, sizeof(int), 0); //"Weź dane spod adresu &m, zmierz tylko treść (int), i wrzuć to do kolejki o numerze msg_id, a jak nie ma miejsca, to czekaj (0)."
+    kill(target_pid, SIGUSR1); //drze mordę do drugiego procesu: "E! Wstawaj i bierz to, co ci zostawiłem!".
+}
+
+void universal_handler(int sig, siginfo_t *info, void *context) {
+    struct Komunikat msg;
+    if (sig == SIGUSR1) {
+        // Każdy proces odbiera komunikat, przetwarza i podaje dalej wg maila [cite: 6, 7, 8]
+        if (msgrcv(msg_id, &msg, sizeof(int), 1, IPC_NOWAIT) != -1) {
+            printf("[Proces %d] Odebrano info o sygnale %d od PID %d\n", getpid(), msg.wartosc_sygnalu, info->si_pid);
+
+            if (getpid() == p3) send_status(p2, msg.wartosc_sygnalu); // program sprawdza do którego procesu ma wysąłc wiadomosc
+            else if (getpid() == p2) send_status(p1, msg.wartosc_sygnalu);
+        }
+    }
+}
+
+void setup_signals() {
+    struct sigaction sa;
+    sa.sa_sigaction = universal_handler;
+    sa.sa_flags = SA_SIGINFO; // Weryfikacja nadawcy
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGUSR1, &sa, NULL);
+}
+// TO JEST UKRYTE W BIBLIOTECE <signal.h> */
+//struct sigaction {
+//  void (*sa_sigaction)(int, siginfo_t *, void *); // <-- To pole wypełniamy
+//    sigset_t sa_mask;                               // <-- To pole czyścimy
+    //int sa_flags;                                   // <-- Tu wpisujemy SA_SIGINFO
+  //  void (*sa_restorer)(void);
+//};
+// --- PROCESY ---
+void wykonaj_p3(const char* zrodlo) {
+    // 1. WŁĄCZENIE NASŁUCHU (DOMOFONU)
+    // Bez tego P3 byłby głuchy na sygnały od Procesu Macierzystego (PM).
+    // Musi to zrobić na samym początku, żeby być gotowym na instrukcje "z góry".
+    setup_signals();
+
+    // 2. WYBÓR ŹRÓDŁA DANYCH
+    // To jest skrócony "if" (operator trójargumentowy).
+    // Jeśli 'zrodlo' (nazwa pliku) istnieje -> otwórz ten plik (fopen).
+    // Jeśli 'zrodlo' to NULL -> użyj klawiatury (stdin).
+    // Realizuje wymóg: "czyta dane ... ze standardowego strumienia wejściowego lub pliku" [cite: 1]
+    FILE *f = (zrodlo) ? fopen(zrodlo, "r") : stdin;
+
+    // 3. PODŁĄCZENIE DO RURY (FIFO)
+    // Otwieramy plik kolejki o nazwie "kolejka_fifo".
+    // O_WRONLY = Open Write Only (Tylko do zapisu).
+    // To jest moment, w którym P3 dzwoni do P2: "Halo, jestem, będę nadawał".
+    int fd = open(NAZWA_FIFO, O_WRONLY);
+
+    // 4. PRZYGOTOWANIE PUDEŁKA
+    // Rezerwujemy pamięć (np. 256 znaków) na pojedynczą linię tekstu.
+    char bufor[ROZMIAR_BUFORA];
+
+    // 5. PĘTLA PRZETWARZANIA
+    // fgets czyta plik linijka po linijce, aż dojedzie do końca (NULL).
+    // Realizuje wymóg: "czyta dane (pojedyncze wiersze)" [cite: 1]
+    while (fgets(bufor, sizeof(bufor), f) != NULL) {
+
+        // 6. WYSYŁKA DO RURY
+        // P3 wrzuca to, co przeczytał, prosto do rury (do zmiennej fd).
+        // Wysyła całe pudełko (sizeof), żeby P2 zawsze wiedział ile odczytać.
+        // Realizuje wymóg: "przekazuje je w niezmienionej formie do procesu 2" [cite: 1]
+        write(fd, bufor, sizeof(bufor));
+
+        // (Tutaj w wersji z wyświetlaniem byłby printf i fflush)
     }
 
-    // 2. Usuwamy Semafory
-    if (g_sem_id != -1) {
-        semctl(g_sem_id, 0, IPC_RMID);
-        printf("[SYSTEM]: Semafory usunięte.\n");
-    }
+    // 7. SPRZĄTANIE I KONIEC
+    // Zamykamy wejście do rury. To sygnał dla P2: "Koniec transmisji, nic więcej nie będzie".
+    // Gdybyś tego nie zamknął, P2 wisiałby i czekał w nieskończoność.
+    close(fd);
 
-    // 3. Usuwamy plik FIFO
-    if (g_fifo_fd != -1) close(g_fifo_fd);
-    unlink(NAZWA_FIFO);
-    printf("[SYSTEM]: Plik FIFO usunięty.\n");
-
-    // 4. Zabijamy całą grupę procesów (P1, P2, P3), żeby nic nie wisiało
-    kill(0, SIGKILL);
+    // Zabijamy proces P3, bo skończył robotę.
     exit(0);
 }
 
-// === POMOCNICZE FUNKCJE SEMAFORÓW ===
-// P (Opuszczenie/Czekanie)
-void sem_p(int sem_id, int sem_num) {
-    struct sembuf operacja = {sem_num, -1, 0};
-    if (semop(sem_id, &operacja, 1) == -1) {
-        if (errno != EINTR) perror("Błąd sem_p"); // Ignorujemy przerwania sygnałem
+void wykonaj_p2() {
+    setup_signals();
+    struct WspolnaPamiec *shm = (struct WspolnaPamiec*)shmat(shm_id, NULL, 0);
+    int fd = open(NAZWA_FIFO, O_RDONLY);
+    char bufor[ROZMIAR_BUFORA];
+    while (read(fd, bufor, sizeof(bufor)) > 0) {
+        sem_p(sem_id, 0);
+        strncpy(shm->tekst, bufor, ROZMIAR_BUFORA);
+        shm->ilosc_bajtow = strlen(bufor);
+        shm->czy_koniec = 0;
+        sem_v(sem_id, 1);
     }
+    sem_p(sem_id, 0);
+    shm->czy_koniec = 1;
+    sem_v(sem_id, 1);
+    exit(0);
 }
 
-// V (Podniesienie/Sygnalizowanie)
-void sem_v(int sem_id, int sem_num) {
-    struct sembuf operacja = {sem_num, 1, 0};
-    if (semop(sem_id, &operacja, 1) == -1) {
-        if (errno != EINTR) perror("Błąd sem_v");
-    }
-}
+void wykonaj_p1() {
+    setup_signals(); // Obsługa sygnałów (wymóg projektu)
 
-// ================= MAIN =================
-int main(int argc, char *argv[]) {
-    // Rejestrujemy funkcję, która posprząta po Ctrl+C
-    signal(SIGINT, obsluga_sygnalu);
+    // Podłączenie pamięci
+    struct WspolnaPamiec *shm = (struct WspolnaPamiec*)shmat(shm_id, NULL, 0);
 
-    // 1. TWORZENIE PAMIĘCI WSPÓŁDZIELONEJ
-    g_shm_id = shmget(KLUCZ_SHM, sizeof(struct WspolnaPamiec), 0666 | IPC_CREAT);
-    if (g_shm_id == -1) { perror("Błąd shmget"); return 1; }
+    while (1) {
+        // Czekamy na dane od P2 (Semafor 1)
+        sem_p(sem_id, 1);
 
-    // 2. TWORZENIE SEMAFORÓW (2 sztuki)
-    // Sem 0: Kontroluje miejsce wolne (dla P2)
-    // Sem 1: Kontroluje dane gotowe (dla P1)
-    g_sem_id = semget(KLUCZ_SEM, 2, 0666 | IPC_CREAT);
-    if (g_sem_id == -1) { perror("Błąd semget"); return 1; }
+        // Sprawdzamy flagę końca
+        if (shm->czy_koniec) break;
 
-    // Inicjalizacja:
-    semctl(g_sem_id, 0, SETVAL, 1); // Sem 0 = 1 (Jest wolne miejsce na start)
-    semctl(g_sem_id, 1, SETVAL, 0); // Sem 1 = 0 (Brak danych na start)
+        // --- ZMIANA: Wyświetlanie danych ---
+        // Usuwamy zbędne "P1 Wyjście" i wyświetlamy sam tekst + obliczenie.
+        // shm->tekst to linia z pliku
+        // shm->ilosc_bajtow to liczba policzona przez P2
 
-    // 3. TWORZENIE FIFO
-    if (mkfifo(NAZWA_FIFO, 0666) == -1) {
-        if (errno != EEXIST) perror("Błąd mkfifo");
-    }
-
-    pid_t pid = fork();
-
-    // ================= PROCES P3 (NADAWCA) =================
-    if (pid == 0) {
-        FILE *zrodlo_danych;
-        int czy_zamykac_plik = 0;
-
-        if (argc > 1) {
-            printf("[P3]: Tryb PLIKOWY: %s\n", argv[1]); fflush(stdout);
-            zrodlo_danych = fopen(argv[1], "r");
-            if (!zrodlo_danych) { perror("Błąd pliku"); exit(1); }
-            czy_zamykac_plik = 1;
+        // Sprawdzamy, czy tekst ma enter na końcu, żeby ładnie wyglądało
+        int len = strlen(shm->tekst);
+        if (len > 0 && shm->tekst[len-1] == '\n') {
+            // Tekst ma już enter, więc wypisujemy go tak:
+            printf("%s [Dlugosc wg P2: %d] ", shm->tekst, shm->ilosc_bajtow);
         } else {
-            printf("[P3]: Tryb INTERAKTYWNY. Pisz (Ctrl+D = koniec).\n"); fflush(stdout);
-            zrodlo_danych = stdin;
+            // Tekst nie ma entera, dodajemy go:
+            printf("%s\n [Dlugosc wg P2: %d]\n ", shm->tekst, shm->ilosc_bajtow);
         }
 
-        // P3 czeka aż P2 otworzy rurę
-        int fifo = open(NAZWA_FIFO, O_WRONLY);
-        if (fifo == -1) { perror("Błąd open FIFO P3"); exit(1); }
+        fflush(stdout); // Wypychamy na ekran natychmiast
 
-        char bufor[ROZMIAR_BUFORA];
-        // Czytamy i wysyłamy
-        while (fgets(bufor, sizeof(bufor), zrodlo_danych) != NULL) {
-            // Wysyłamy ZAWSZE pełną ramkę 256 bajtów
-            // To zapobiega sklejaniu się napisów w FIFO
-            write(fifo, bufor, sizeof(bufor));
-        }
-
-        if (czy_zamykac_plik) fclose(zrodlo_danych);
-        close(fifo);
-        printf("[P3]: Koniec danych. Zamykam się.\n");
-        exit(0);
+        // Zwalniamy miejsce dla P2 (Semafor 0)
+        sem_v(sem_id, 0);
     }
 
-    // ================= BLOK RODZICA =================
-    else {
-        pid_t pid2 = fork();
+    shmdt(shm); // Odłączamy pamięć
+    exit(0);
+}
 
-        if (pid2 == 0) {
-            // ================= PROCES P2 (POŚREDNIK) =================
-            // Logika: Czyta FIFO -> Liczy bajty -> Pisze do SHM
+int main(int argc, char *argv[]) {
+    // 1. BUDOWANIE INFRASTRUKTURY (Zasoby IPC)
+    // Tworzymy Pamięć Współdzieloną (biurko P2 i P1) [cite: 1]
+    shm_id = shmget(KLUCZ_SHM, sizeof(struct WspolnaPamiec), 0666 | IPC_CREAT);
 
-            struct WspolnaPamiec *wspolna = (struct WspolnaPamiec*) shmat(g_shm_id, NULL, 0);
+    // Tworzymy 2 Semafory (światła drogowe dla pamięci) [cite: 1]
+    sem_id = semget(KLUCZ_SEM, 2, 0666 | IPC_CREAT);
 
-            printf("[P2]: Czekam na połączenie FIFO...\n"); fflush(stdout);
-            g_fifo_fd = open(NAZWA_FIFO, O_RDONLY);
+    // Tworzymy Kolejkę Komunikatów (Paczkomat na sygnały) [cite: 4]
+    msg_id = msgget(KLUCZ_MSG, 0666 | IPC_CREAT);
 
-            char bufor_odbiorczy[ROZMIAR_BUFORA];
-            int bajty;
+    // 2. USTAWIANIE ŚWIATEŁ (Semaforów)
+    // Semafor 0 = 1 (ZIELONE): "Pamięć jest pusta, P2 może pisać".
+    semctl(sem_id, 0, SETVAL, 1);
+    // Semafor 1 = 0 (CZERWONE): "Pamięć jest pusta, P1 musi czekać".
+    semctl(sem_id, 1, SETVAL, 0);
 
-            // Pętla odczytu z FIFO
-            while ((bajty = read(g_fifo_fd, bufor_odbiorczy, sizeof(bufor_odbiorczy))) > 0) {
+    // 3. TWORZENIE RURY (FIFO)
+    // Tworzymy plik specjalny "kolejka_fifo" na dysku (kanał P3 -> P2)[cite: 1].
+    mkfifo(NAZWA_FIFO, 0666);
 
-                // CZEKAJ NA WOLNE MIEJSCE W PAMIĘCI (Sem 0 w dół)
-                sem_p(g_sem_id, 0);
+    // 4. ZATRUDNIANIE PRACOWNIKÓW (Forkowanie)
+    // PM klonuje się 3 razy. Każdy klon staje się innym pracownikiem.
+    // Realizuje to wymóg: "Wszystkie trzy procesy powinny być powoływane automatycznie z jednego procesu inicjującego".
 
-                // --- SEKCJA KRYTYCZNA ---
-                // 1. Obliczamy długość (wymóg zadania)
-                int dlugosc = strlen(bufor_odbiorczy);
-                // (Opcjonalnie usuwamy enter z końca dla ładnego wyglądu)
-                if (dlugosc > 0 && bufor_odbiorczy[dlugosc-1] == '\n') dlugosc--;
+    if ((p1 = fork()) == 0) wykonaj_p1(); // Dziecko 1 staje się P1
+    if ((p2 = fork()) == 0) wykonaj_p2(); // Dziecko 2 staje się P2
 
-                // 2. Kopiujemy do pamięci współdzielonej
-                strcpy(wspolna->tekst, bufor_odbiorczy);
-                wspolna->ilosc_bajtow = dlugosc;
-                wspolna->czy_koniec = 0;
+    // Dziecko 3 staje się P3 i dostaje nazwę pliku z argumentów (argv[1])
+    if ((p3 = fork()) == 0) wykonaj_p3(argc > 1 ? argv[1] : NULL);
 
-                printf("   [P2] Przeliczyłem: %d znaków. Wstawiam do SHM.\n", dlugosc);
-                fflush(stdout);
+    // 5. INICJACJA SCENARIUSZA POWIADAMIANIA
+    // Dajemy chwilę (1s), żeby pracownicy zdążyli włączyć nasłuch (setup_signals).
+    sleep(1);
 
-                // SYGNALIZUJ DANE GOTOWE DLA P1 (Sem 1 w górę)
-                sem_v(g_sem_id, 1);
-            }
+    // TO JEST KLUCZOWE: PM wysyła pierwszy sygnał do P3.
+    // Realizuje to dokładnie instrukcję z maila: "Proces macierzysty zapisuje wartość sygnału... oraz wysyła powiadomienie do procesu 3"[cite: 6].
+    // Bez tego łańcuch sygnałów (PM -> P3 -> P2 -> P1) by nie ruszył.
+    send_status(p3, SIGUSR1);
 
-            // Obsługa końca transmisji (gdy P3 zamknął rurę)
-            sem_p(g_sem_id, 0);       // Czekaj na dostęp
-            wspolna->czy_koniec = 1;  // Ustaw flagę końca
-            sem_v(g_sem_id, 1);       // Powiadom P1
+    // 6. NADZÓR (Czekanie na fajrant)
+    // PM czeka, aż wszystkie 3 procesy zakończą pracę (np. po skończeniu pliku).
+    for(int i=0; i<3; i++) wait(NULL);
 
-            printf("[P2]: Koniec pracy. Odłączam SHM i znikam.\n");
-            shmdt(wspolna);
-            close(g_fifo_fd);
-            exit(0);
-        }
-        else {
-            // ================= PROCES P1 (KONSUMENT / GLÓWNY) =================
-            // Logika: Czeka na SHM -> Wyświetla wynik
+    // 7. SPRZĄTANIE PO IMPREZIE
+    // Usuwamy biurko (SHM), światła (SEM) i paczkomat (MSG) z systemu.
+    shmctl(shm_id, IPC_RMID, NULL);
+    semctl(sem_id, 0, IPC_RMID);
+    msgctl(msg_id, IPC_RMID, NULL);
 
-            struct WspolnaPamiec *wspolna = (struct WspolnaPamiec*) shmat(g_shm_id, NULL, 0);
-
-            printf("[P1]: Gotowy. Czekam na dane z Pamięci Współdzielonej...\n");
-            fflush(stdout);
-
-            while (1) {
-                // CZEKAJ NA DANE (Sem 1 w dół)
-                sem_p(g_sem_id, 1);
-
-                // Sprawdzamy, czy P2 zgłosił koniec
-                if (wspolna->czy_koniec == 1) {
-                    sem_v(g_sem_id, 0); // Zwalniamy semafor (dobra praktyka)
-                    break; // Wychodzimy z pętli
-                }
-
-                // Wyświetlamy dane
-                printf("      ---> \033[32m[P1] Wynik z SHM: %s (Dlugosc: %d)\033[0m",
-                       wspolna->tekst, wspolna->ilosc_bajtow);
-
-                // Dokładamy enter jeśli go brakuje
-                if (wspolna->tekst[strlen(wspolna->tekst)-1] != '\n') printf("\n");
-                fflush(stdout);
-
-                // ZWALNIAMY MIEJSCE DLA P2 (Sem 0 w górę)
-                sem_v(g_sem_id, 0);
-            }
-
-            printf("\n[P1]: P2 zakończył pracę. Usuwam zasoby IPC.\n");
-
-            // Sprzątanie po normalnym zakończeniu
-            shmdt(wspolna);
-            shmctl(g_shm_id, IPC_RMID, NULL); // Usuń pamięć
-            semctl(g_sem_id, 0, IPC_RMID);    // Usuń semafory
-            unlink(NAZWA_FIFO);               // Usuń plik kolejki
-
-            // Czekamy, aż dzieci formalnie zakończą procesy
-            wait(NULL);
-            wait(NULL);
-            printf("[SYSTEM]: Koniec programu. Wszystko czyste.\n");
-        }
-    }
+    // Usuwamy plik rury z dysku.
+    unlink(NAZWA_FIFO);
 
     return 0;
 }
