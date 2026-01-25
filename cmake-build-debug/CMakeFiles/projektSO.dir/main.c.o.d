@@ -1,6 +1,6 @@
 CMakeFiles/projektSO.dir/main.c.o: \
- /home/sebastian/CLionProjects/projekt-SO/main.c \
- /usr/include/stdc-predef.h /usr/include/stdio.h \
+ /home/unkn0wn/CLionProjects/projekt-SO/main.c /usr/include/stdc-predef.h \
+ /usr/include/stdio.h \
  /usr/include/x86_64-linux-gnu/bits/libc-header-start.h \
  /usr/include/features.h /usr/include/features-time64.h \
  /usr/include/x86_64-linux-gnu/bits/wordsize.h \

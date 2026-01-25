@@ -1,4 +1,4 @@
-/home/sebastian/CLionProjects/projekt-SO/cmake-build-debug/CMakeFiles/projektSO.dir
-/home/sebastian/CLionProjects/projekt-SO/cmake-build-debug/CMakeFiles/generator.dir
-/home/sebastian/CLionProjects/projekt-SO/cmake-build-debug/CMakeFiles/edit_cache.dir
-/home/sebastian/CLionProjects/projekt-SO/cmake-build-debug/CMakeFiles/rebuild_cache.dir
+/home/unkn0wn/CLionProjects/projekt-SO/cmake-build-debug/CMakeFiles/projektSO.dir
+/home/unkn0wn/CLionProjects/projekt-SO/cmake-build-debug/CMakeFiles/generator.dir
+/home/unkn0wn/CLionProjects/projekt-SO/cmake-build-debug/CMakeFiles/edit_cache.dir
+/home/unkn0wn/CLionProjects/projekt-SO/cmake-build-debug/CMakeFiles/rebuild_cache.dir
