@@ -1,11 +1,3 @@
-/*
- * KOMPLETNY PROGRAM: P3->FIFO->P2->SHM+SEM->P1
- * WERSJA FINALNA:
- * 1. SIGCONT/SIGSTOP działają poprawnie (sigsuspend, WUNTRACED).
- * 2. GRACEFUL SHUTDOWN (plik): P3 kończy wysyłać plik zanim się wyłączy.
- * 3. MENU SHUTDOWN: P3 wysyła EXIT_TOKEN do reszty, jeśli dostanie SIGTERM w menu.
- */
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -26,7 +18,7 @@
 #include <time.h>
 
 /* --- KONFIGURACJA --- */
-#define FIFO_PATH "/tmp/p3_p2_fifo"
+#define FIFO_PATH "kolejka_fifo"
 #define MAX_LINE 1024
 
 /* Klucze IPC */
@@ -172,7 +164,7 @@ void p3_notify_handler(int sig) {
     }
 }
 
-void p2_external_sig_handler(int sig) {
+void p2_external_sig_handler(int sig) { //jak p2 dostanie sygnał od procesu 
     pid_t pp = getppid();
     if (pp > 1) kill(pp, sig);
 }
@@ -403,7 +395,7 @@ void process_p2(void) {
         if (part > 0 && buf[part-1] == '\n') {
             long total = line_len + (part - 1);
             sem_wait_safe(SEM_EMPTY, &p2_paused, &ignore_term, "P2");
-            snprintf(shm_ptr->buffer, MAX_LINE, "%ld", total);
+            snprintf(shm_ptr->buffer, MAX_LINE, "Dlugosc: %ld Tresc: %s", total,buf);
             sem_post_safe(SEM_FULL);
             line_len = 0;
         } else {
@@ -443,7 +435,7 @@ void process_p3(const char *path) {
 
         wait_if_paused(&p3_paused, &p3_term, "P3");
 
-        printf("\n=== MENU P3 ===\n1. Klawiatura\n2. Plik\nWybierz > ");
+        printf("PID p2 (do wysyłania sygnałów): %d \n\n=== MENU P3 === \n1. Klawiatura\n2. Plik\nWybierz > ",getpid()-1);
         fflush(stdout);
 
         if (!safe_fgets_interruptible(stdin, choice, sizeof(choice), &p3_paused, &p3_term)) {
