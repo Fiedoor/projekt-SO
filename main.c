@@ -1,289 +1,624 @@
-#include <stdio.h> //dpowiada za standardowe wejście i wyjście
-#include <stdlib.h> //Zawiera funkcje ogólne, takie jak exit() (kończenie procesu) czy malloc (zarządzanie pamięcią).
-#include <unistd.h> //zawiera kluczowe funkcje systemowe: fork() (tworzenie P1, P2, P3 ), pipe() (łącza), read/write (obsługa FIFO i PIPE) oraz close
-#include <sys/types.h> //(((definiują typy danych używane przez system (np. pid_t) oraz funkcje do sprawdzania statusu plików i tworzenia ich, jak mkfifo.
-#include <sys/stat.h> //)))
-#include <fcntl.h> //(File Control) Służy do kontrolowania deskryptorów plików. Dzięki niej możesz otwierać pliki i rury w konkretnych trybach, np. O_RDONLY (tylko odczyt) lub O_WRONLY (tylko zapis).
+/*
+ * KOMPLETNY PROGRAM: P3->FIFO->P2->SHM+SEM->P1
+ * WERSJA FINALNA:
+ * 1. SIGCONT/SIGSTOP działają poprawnie (sigsuspend, WUNTRACED).
+ * 2. GRACEFUL SHUTDOWN (plik): P3 kończy wysyłać plik zanim się wyłączy.
+ * 3. MENU SHUTDOWN: P3 wysyła EXIT_TOKEN do reszty, jeśli dostanie SIGTERM w menu.
+ */
+
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
-#include <sys/wait.h> //Pozwala Procesowi Macierzystemu (PM) czekać na zakończenie pracy swoich dzieci (P1, P2, P3), aby uniknąć "procesów zombie"
-//#include <sys/ipc.h> //Zawiera ogólne definicje dla mechanizmów komunikacji międzyprocesowej (Inter-Process Communication). Pozwala generować unikalne klucze dla zasobów.
-#include <sys/shm.h> //obsługa Pamięci Współdzielonej (Shared Memory). Umożliwia P2 i P1 dostęp do tego samego obszaru RAM
-#include <sys/sem.h> //Obsługa Semaforów. Pozwalają one synchronizować dostęp do pamięci, by P1 nie czytał danych, których P2 jeszcze nie zdążył zapisać.
-#include <sys/msg.h> //Obsługa Kolejek Komunikatów. To w nich Proces Macierzysty zapisuje wartości sygnałów, które potem odczytują P3, P2 i P1.
-#include <errno.h> //systemowa biblioteka do obsługi błędów. Jeśli np. mkfifo się nie uda, errno powie Ci dokładnie, czy problemem był brak uprawnień, czy to, że plik już istnieje.
-#include <signal.h> //Odpowiada za obsługę Sygnałów (np. SIGUSR1, SIGTERM). Pozwala procesom "pukać do siebie nawzajem" i informować o stanie.
-//DYREKTYWY
-#define NAZWA_FIFO "kolejka_fifo"
-#define ROZMIAR_BUFORA 256
-#define KLUCZ_SHM 12345 //WSPÓLNA PAMIEC DLA KILKU ROCESÓW
-#define KLUCZ_SEM 67890 //SEMAFORY - STEROWANIE PROCESAMI
-#define KLUCZ_MSG 54321 //SYGNAŁY - KONTROLA CO SIE DZIEJE PRZEKAZ INFORMACJI
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <unistd.h>
+#include <stdbool.h>
+#include <sys/types.h>
+#include <sys/ipc.h>
+#include <sys/msg.h>
+#include <sys/shm.h>
+#include <sys/sem.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <termios.h>
+#include <time.h>
 
-struct WspolnaPamiec { //obszar P2 i P1
-    char tekst[ROZMIAR_BUFORA]; //P2 wpisuje tu to, co odebrał z FIFO.
-    int ilosc_bajtow; //To miejsce na wynik pracy procesu P2. P2 liczy znaki (strlen) i wpisuje liczbę tutaj. P1 stąd ją odczytuje.
-    int czy_koniec; //oznaczenie czy plik został cały odczytan
-};
+/* --- KONFIGURACJA --- */
+#define FIFO_PATH "/tmp/p3_p2_fifo"
+#define MAX_LINE 1024
 
-struct Komunikat {//przestrzeń dla komunikatow
+/* Klucze IPC */
+#define QUEUE_KEY_CHAR 'Q'
+#define SHM_KEY_CHAR   'S'
+#define SEM_KEY_CHAR   'X'
+
+/* Typy komunikatów */
+#define KY1 1L
+#define KY2 2L
+#define KY3 3L
+#define ACK_MTYPE 4L
+
+/* Semafory */
+#define SEM_EMPTY 0  
+#define SEM_FULL  1  
+
+/* Znaczniki */
+#define BATCH_END_TOKEN "__BATCH_END__"
+#define EXIT_TOKEN "__EXIT__"
+
+/* --- STRUKTURY DANYCH --- */
+
+typedef struct {
+    char buffer[MAX_LINE];
+} SharedData;
+
+typedef struct {
     long mtype;
-    int wartosc_sygnalu; //Twoje dane
+    int sig;
+} ctrl_msg_t;
+
+union semun {
+    int val;
+    struct semid_ds *buf;
+    unsigned short *array;
 };
 
-int shm_id; //ID Pamięci Współdzielonej
-int sem_id; // ID Semaforów
-int msg_id; // ID Kolejki Komunikatów
-pid_t p1, p2, p3; // Numery procesów (Process ID)
+/* --- ZMIENNE GLOBALNE --- */
 
-// --- SEMAFORY ---
-void sem_p(int s_id, int s_num) {
-    // Tworzymy strukturę operacji
-    // s_num: numer semafora (0 lub 1)
-    // -1:    operacja odejmowania (chcę wziąć zasób)
-    // 0:     flagi (standardowe zachowanie)
-    struct sembuf op = {s_num, -1, 0};
-    while (semop(s_id, &op, 1) == -1) if (errno != EINTR) break;
-    // Jeśli semop zwrócił błąd (-1), sprawdzamy dlaczego.
-    // EINTR oznacza "Interrupted System Call" - przerwanie przez sygnał.
-    // W Twoim projekcie przechodzą sygnały SIGUSR1. One przerywają czekanie na semaforze.
-    // Jeśli to nie był sygnał (tylko np. błąd pamięci), to przerywamy pętlę (break).
+int msq_id = -1;
+int shm_id = -1;
+int sem_id = -1;
+SharedData *shm_ptr = NULL;
+
+pid_t pid_p1 = -1;
+pid_t pid_p2 = -1;
+pid_t pid_p3 = -1;
+
+/* Flagi sterujące */
+volatile sig_atomic_t parent_got_sig = 0;
+volatile sig_atomic_t parent_last_sig = 0;
+volatile sig_atomic_t parent_sender_pid = 0;
+
+volatile sig_atomic_t p1_paused = 0, p1_term = 0;
+volatile sig_atomic_t p2_paused = 0, p2_term = 0;
+volatile sig_atomic_t p3_paused = 0, p3_term = 0;
+
+/* --- DEKLARACJE --- */
+void die(const char *msg);
+void notify(pid_t pid);
+void setup_signal_mask(void);
+void wait_if_paused(volatile sig_atomic_t *paused, volatile sig_atomic_t *term, const char *who);
+void sem_wait_safe(int sem_idx, volatile sig_atomic_t *paused, volatile sig_atomic_t *term, const char *who);
+void sem_post_safe(int sem_idx);
+int safe_msgsnd(int q, const void *msgp, size_t msgsz, int msgflg);
+void drain_ack_queue(void);
+void chomp(char *s);
+ssize_t safe_write_interruptible(int fd, const void *buf, size_t count, volatile sig_atomic_t *paused, volatile sig_atomic_t *term, const char *who);
+bool safe_fgets_interruptible(FILE *f, char *buf, size_t sz, volatile sig_atomic_t *paused, volatile sig_atomic_t *term);
+
+/* --- IMPLEMENTACJA --- */
+
+void die(const char *msg) {
+    perror(msg);
+    exit(1);
 }
 
-void sem_v(int s_id, int s_num) {
-    // 1: operacja dodawania     (oddaję zasób, zwiększam licznik)
-    struct sembuf op = {s_num, 1, 0};
-    //zabezpieczenie przed przerwaniem przez sygnał
-    while (semop(s_id, &op, 1) == -1) if (errno != EINTR) break;
+void notify(pid_t pid) {
+    if (pid > 0) kill(pid, SIGUSR1);
 }
 
-// --- OBSŁUGA SYGNAŁÓW ---
-void send_status(int target_pid, int signal_val) {
-    struct Komunikat m = {1, signal_val};
-    msgsnd(msg_id, &m, sizeof(int), 0); //"Weź dane spod adresu &m, zmierz tylko treść (int), i wrzuć to do kolejki o numerze msg_id, a jak nie ma miejsca, to czekaj (0)."
-    kill(target_pid, SIGUSR1); //wysłanie sygnału przez kill
+void chomp(char *s) {
+    if (!s) return;
+    size_t len = strlen(s);
+    if (len > 0 && s[len - 1] == '\n') s[len - 1] = '\0';
 }
 
-void universal_handler(int sig, siginfo_t *info, void *context) {
-    struct Komunikat msg;
+void setup_signal_mask(void) {
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);  
+    sigaddset(&mask, SIGQUIT);
+    sigprocmask(SIG_BLOCK, &mask, NULL);
+}
+
+void apply_control_sig(const char *who, int sig, volatile sig_atomic_t *paused, volatile sig_atomic_t *term) {
+    if (sig == SIGTSTP) {
+        *paused = 1;
+    } else if (sig == SIGCONT) {
+        *paused = 0;
+    } else if (sig == SIGTERM) {
+        *term = 1;
+        *paused = 0; 
+    }
+}
+
+/* --- HANDLERY --- */
+
+void parent_sig_handler(int sig, siginfo_t *info, void *u) {
+    (void)u;
+    if (info) parent_sender_pid = info->si_pid;
+    parent_last_sig = sig;
+    parent_got_sig = 1;
+}
+
+void p1_notify_handler(int sig) {
     if (sig == SIGUSR1) {
-        // Każdy proces odbiera komunikat, przetwarza i podaje dalej
-        if (msgrcv(msg_id, &msg, sizeof(int), 1, IPC_NOWAIT) != -1) {
-
-            if (getpid() == p3) send_status(p2, msg.wartosc_sygnalu); // program sprawdza do którego procesu ma wysłać wiadomosc
-            else if (getpid() == p2) send_status(p1, msg.wartosc_sygnalu);
+        ctrl_msg_t msg;
+        while (msgrcv(msq_id, &msg, sizeof(int), KY1, IPC_NOWAIT) != -1) {
+            apply_control_sig("P1", msg.sig, &p1_paused, &p1_term);
         }
     }
 }
 
-void setup_signals() {
-    struct sigaction sa;
-    sa.sa_sigaction = universal_handler;
-    // Dodajemy SA_RESTART. Dzięki temu, gdy przyjdzie sygnał podczas pisania na klawiaturze (fgets),
-    // funkcja nie wyrzuci błędu i nie przerwie programu, tylko wznowi czekanie na tekst.
-    sa.sa_flags = SA_SIGINFO | SA_RESTART; // Weryfikacja nadawcy
-    sigemptyset(&sa.sa_mask);
-    sigaction(SIGUSR1, &sa, NULL);
+void p2_notify_handler(int sig) {
+    if (sig == SIGUSR1) {
+        ctrl_msg_t msg;
+        while (msgrcv(msq_id, &msg, sizeof(int), KY2, IPC_NOWAIT) != -1) {
+            apply_control_sig("P2", msg.sig, &p2_paused, &p2_term);
+            notify(pid_p1);
+        }
+    }
 }
 
-// --- PROCESY ---
-void wykonaj_p3(const char* zrodlo) {
-    // 1. WŁĄCZENIE NASŁUCHU
-    // Bez tego P3 byłby głuchy na sygnały od Procesu Macierzystego (PM).
-    // Musi to zrobić na samym początku, żeby być gotowym na instrukcje "z góry".
-    setup_signals();
+void p3_notify_handler(int sig) {
+    if (sig == SIGUSR1) {
+        ctrl_msg_t msg;
+        while (msgrcv(msq_id, &msg, sizeof(int), KY3, IPC_NOWAIT) != -1) {
+            apply_control_sig("P3", msg.sig, &p3_paused, &p3_term);
+            notify(pid_p2);
+        }
+    }
+}
 
-    // P3 informuje PM: "Jestem gotowy!". Podnosi semafor nr 2.
-    sem_v(sem_id, 2);
+void p2_external_sig_handler(int sig) {
+    pid_t pp = getppid();
+    if (pp > 1) kill(pp, sig);
+}
 
-    // 2. WYBÓR ŹRÓDŁA DANYCH
-    // Jeśli 'zrodlo' (nazwa pliku) istnieje -> otwórz ten plik (fopen).
-    // Jeśli 'zrodlo' to NULL -> użyj klawiatury (stdin).
-    // Realizuje wymóg: "czyta dane ... ze standardowego strumienia wejściowego lub pliku"
-    FILE *f;
-    if (zrodlo != NULL) {
-        f = fopen(zrodlo, "r");
-        if (!f) { perror("Blad otwarcia pliku"); exit(1); }
-    } else {
-        f = stdin;
-        printf("\n--- TRYB INTERAKTYWNY ---\n");
-        printf("Jestes w procesie P3. Wpisz tekst i wcisnij ENTER.\n");
-        printf("Aby zakonczyc, wcisnij Ctrl+D (EOF).\n");
-        printf("-------------------------\n> ");
+/* --- PAUZA (sigsuspend) --- */
+void wait_if_paused(volatile sig_atomic_t *paused, volatile sig_atomic_t *term, const char *who) {
+    if (*paused && !*term) {
+        const char *msg = " [PAUZA]\n";
+        write(STDERR_FILENO, msg, strlen(msg));
+
+        sigset_t mask, oldmask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGUSR1);
+        sigprocmask(SIG_BLOCK, &mask, &oldmask);
+
+        while (*paused && !*term) {
+            sigsuspend(&oldmask);
+        }
+        sigprocmask(SIG_SETMASK, &oldmask, NULL);
+
+        if (!*term) {
+            const char *msg2 = " [WZNOWIONO]\n";
+            write(STDERR_FILENO, msg2, strlen(msg2));
+        }
+    }
+}
+
+/* --- SEMAFORY --- */
+void sem_wait_safe(int sem_idx, volatile sig_atomic_t *paused, volatile sig_atomic_t *term, const char *who) {
+    struct sembuf sb;
+    sb.sem_num = sem_idx;
+    sb.sem_op = -1;
+    sb.sem_flg = 0;
+
+    while (1) {
+        /* P1 i P2 ignorują 'term' jako sygnał natychmiastowego wyjścia */
+        wait_if_paused(paused, term, who);
+        
+        if (semop(sem_id, &sb, 1) == -1) {
+            if (errno == EINTR) continue;
+            die("Błąd semop wait");
+        }
+        break;
+    }
+}
+
+void sem_post_safe(int sem_idx) {
+    struct sembuf sb;
+    sb.sem_num = sem_idx;
+    sb.sem_op = 1;
+    sb.sem_flg = 0;
+    while (semop(sem_id, &sb, 1) == -1) {
+        if (errno == EINTR) continue;
+        die("Błąd semop post");
+    }
+}
+
+/* --- I/O SAFE --- */
+int safe_msgsnd(int q, const void *msgp, size_t msgsz, int msgflg) {
+    while (1) {
+        if (msgsnd(q, msgp, msgsz, msgflg) == 0) return 0;
+        if (errno == EINTR) continue;
+        return -1;
+    }
+}
+
+void drain_ack_queue(void) {
+    ctrl_msg_t msg;
+    while (msgrcv(msq_id, &msg, sizeof(int), ACK_MTYPE, IPC_NOWAIT) >= 0);
+}
+
+/* Funkcja zapisu - obsługuje flagę 'term' */
+ssize_t safe_write_interruptible(int fd, const void *buf, size_t count, volatile sig_atomic_t *paused, volatile sig_atomic_t *term, const char *who) {
+    size_t done = 0;
+    const char *ptr = (const char *)buf;
+    while (done < count) {
+        if (*term) return -1;
+        wait_if_paused(paused, term, who);
+        
+        ssize_t n = write(fd, ptr + done, count - done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        done += n;
+    }
+    return done;
+}
+
+bool safe_fgets_interruptible(FILE *f, char *buf, size_t sz, volatile sig_atomic_t *paused, volatile sig_atomic_t *term) {
+    while (1) {
+        if (*term) return false;
+        wait_if_paused(paused, term, "Fgets");
+        if (*term) return false;
+        
+        errno = 0;
+        char *res = fgets(buf, (int)sz, f);
+        if (res) return true;
+        
+        if (errno == EINTR) {
+            clearerr(f);
+            continue;
+        }
+        if (feof(f)) return false;
+        return false;
+    }
+}
+
+void parent_send_control(int sig) {
+    ctrl_msg_t m = { .sig = sig };
+    m.mtype = KY3; safe_msgsnd(msq_id, &m, sizeof(int), 0);
+    m.mtype = KY2; safe_msgsnd(msq_id, &m, sizeof(int), 0);
+    m.mtype = KY1; safe_msgsnd(msq_id, &m, sizeof(int), 0);
+    notify(pid_p3);
+}
+
+/* --- PROCESY ROBOCZE --- */
+
+void process_p1(void) {
+    setup_signal_mask();
+    shm_ptr = (SharedData *)shmat(shm_id, NULL, 0);
+    if (shm_ptr == (void *)-1) die("shmat P1");
+
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sa.sa_handler = p1_notify_handler;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    fprintf(stderr, "[P1] Start.\n");
+
+    /* P1 ignoruje SIGTERM jako powód wyjścia. Czeka na token. */
+    volatile sig_atomic_t ignore_term = 0;
+
+    while (1) {
+        wait_if_paused(&p1_paused, &p1_term, "P1");
+        
+        sem_wait_safe(SEM_FULL, &p1_paused, &ignore_term, "P1");
+
+        char local_buf[MAX_LINE];
+        strncpy(local_buf, shm_ptr->buffer, MAX_LINE);
+        local_buf[MAX_LINE-1] = '\0';
+
+        sem_post_safe(SEM_EMPTY);
+
+        if (strcmp(local_buf, BATCH_END_TOKEN) == 0) {
+            ctrl_msg_t ack = { .mtype = ACK_MTYPE, .sig = 0 };
+            safe_msgsnd(msq_id, &ack, sizeof(int), 0);
+            fprintf(stderr, "[P1] Koniec partii -> ACK\n");
+            continue;
+        }
+
+        if (strcmp(local_buf, EXIT_TOKEN) == 0) {
+            ctrl_msg_t ack = { .mtype = ACK_MTYPE, .sig = 1 };
+            safe_msgsnd(msq_id, &ack, sizeof(int), 0);
+            fprintf(stderr, "[P1] Otrzymano EXIT token. Koniec.\n");
+            break;
+        }
+
+        printf("Wynik (P1): %s\n", local_buf);
         fflush(stdout);
     }
+    shmdt(shm_ptr);
+    exit(0);
+}
 
-    // 3. PODŁĄCZENIE DO FIFO
-    // Otwieramy plik kolejki o nazwie "kolejka_fifo".
-    // O_WRONLY = Open Write Only
-    // Jeśli open() dostanie sygnał, zwróci -1 i errno=EINTR. Musimy próbować do skutku.
-    int fd;
-    do {
-        fd = open(NAZWA_FIFO, O_WRONLY);
-    } while (fd == -1 && errno == EINTR);
+void process_p2(void) {
+    setup_signal_mask();
+    shm_ptr = (SharedData *)shmat(shm_id, NULL, 0);
+    if (shm_ptr == (void *)-1) die("shmat P2");
 
-    if (fd == -1) { perror("Błąd otwarcia FIFO w P3"); exit(1); }
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sa.sa_handler = p2_external_sig_handler;
+    sigaction(SIGTSTP, &sa, NULL);
+    sigaction(SIGCONT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
 
-    // 4. PRZYGOTOWANIE BUFORA
-    // Rezerwujemy pamięć (256 znaków) na pojedynczą linię tekstu.
-    char bufor[ROZMIAR_BUFORA];
+    struct sigaction sa_n;
+    sigemptyset(&sa_n.sa_mask);
+    sa_n.sa_flags = 0;
+    sa_n.sa_handler = p2_notify_handler;
+    sigaction(SIGUSR1, &sa_n, NULL);
 
-    // 5. PĘTLA PRZETWARZANIA
-    // fgets czyta plik linijka po linijce, aż dojedzie do końca (NULL).
-    // Realizuje wymóg: "czyta dane (pojedyncze wiersze)"
+    int fifo = open(FIFO_PATH, O_RDONLY);
+    if (fifo == -1) die("open FIFO P2");
+    FILE *fin = fdopen(fifo, "r");
+
+    fprintf(stderr, "[P2] Start.\n");
+
+    char buf[MAX_LINE];
+    long line_len = 0;
+
+    /* P2 ignoruje SIGTERM jako powód wyjścia. Czeka na token od P3. */
+    volatile sig_atomic_t ignore_term = 0;
+
     while (1) {
-        if (fgets(bufor, sizeof(bufor), f) == NULL) {
+        wait_if_paused(&p2_paused, &p2_term, "P2");
+
+        if (!safe_fgets_interruptible(fin, buf, sizeof(buf), &p2_paused, &ignore_term)) {
+            /* EOF na FIFO - zazwyczaj oznacza śmierć P3 */
+            if (line_len > 0) {
+                sem_wait_safe(SEM_EMPTY, &p2_paused, &ignore_term, "P2");
+                snprintf(shm_ptr->buffer, MAX_LINE, "%ld", line_len);
+                sem_post_safe(SEM_FULL);
+            }
+            break;
+        }
+
+        if (strcmp(buf, BATCH_END_TOKEN "\n") == 0) {
+            sem_wait_safe(SEM_EMPTY, &p2_paused, &ignore_term, "P2");
+            strcpy(shm_ptr->buffer, BATCH_END_TOKEN);
+            sem_post_safe(SEM_FULL);
+            line_len = 0;
+            continue;
+        }
+
+        if (strcmp(buf, EXIT_TOKEN "\n") == 0) {
+            sem_wait_safe(SEM_EMPTY, &p2_paused, &ignore_term, "P2");
+            strcpy(shm_ptr->buffer, EXIT_TOKEN);
+            sem_post_safe(SEM_FULL);
+            fprintf(stderr, "[P2] Otrzymano EXIT token. Przekazuję i kończę.\n");
+            break;
+        }
+
+        size_t part = strlen(buf);
+        if (part > 0 && buf[part-1] == '\n') {
+            long total = line_len + (part - 1);
+            sem_wait_safe(SEM_EMPTY, &p2_paused, &ignore_term, "P2");
+            snprintf(shm_ptr->buffer, MAX_LINE, "%ld", total);
+            sem_post_safe(SEM_FULL);
+            line_len = 0;
+        } else {
+            line_len += part;
+        }
+    }
+    shmdt(shm_ptr);
+    fclose(fin);
+    exit(0);
+}
+
+void process_p3(const char *path) {
+    setup_signal_mask();
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sa.sa_handler = p3_notify_handler;
+    sigaction(SIGUSR1, &sa, NULL);
+
+    int fifo = open(FIFO_PATH, O_WRONLY);
+    if (fifo == -1) die("open FIFO P3");
+
+    fprintf(stderr, "[P3] Start.\n");
+
+    char buf[MAX_LINE];
+    char choice[16];
+
+    while (1) {
+        /* Jeśli SIGTERM przyszedł, gdy byliśmy w pętli (ale nie w fgets), wychodzimy */
+        if (p3_term) {
+            /* Musimy powiadomić P2 o wyjściu, zanim sami wyjdziemy! */
+             volatile sig_atomic_t ignore_term_exit = 0;
+             fprintf(stderr, "[P3] Wykryto SIGTERM na starcie pętli. Kończę.\n");
+             safe_write_interruptible(fifo, EXIT_TOKEN "\n", strlen(EXIT_TOKEN)+1, &p3_paused, &ignore_term_exit, "P3");
+             break;
+        }
+
+        wait_if_paused(&p3_paused, &p3_term, "P3");
+
+        printf("\n=== MENU P3 ===\n1. Klawiatura\n2. Plik\nWybierz > ");
+        fflush(stdout);
+
+        if (!safe_fgets_interruptible(stdin, choice, sizeof(choice), &p3_paused, &p3_term)) {
+            /* Jeśli safe_fgets zwróciło false i jest p3_term, to znaczy, 
+               że użytkownik wysłał SIGTERM będąc w menu. */
+            if (p3_term) {
+                fprintf(stderr, "[P3] SIGTERM w menu -> Wysyłam EXIT token i kończę.\n");
+                volatile sig_atomic_t ignore_term_exit = 0;
+                
+                /* 1. Wysyłam token do P2 */
+                safe_write_interruptible(fifo, EXIT_TOKEN "\n", strlen(EXIT_TOKEN)+1, &p3_paused, &ignore_term_exit, "P3");
+                
+                /* 2. Czekam aż reszta się zamknie (odbieram ACK od P1) */
+                ctrl_msg_t ack;
+                while (msgrcv(msq_id, &ack, sizeof(int), ACK_MTYPE, 0) < 0);
+
+                break; /* Wyjście z programu */
+            }
+            continue;
+        }
+        int op = atoi(choice);
+
+        if (op == 1) {
+            printf("Wpisuj (kropka . kończy):\n");
+            while (1) {
+                if (!safe_fgets_interruptible(stdin, buf, sizeof(buf), &p3_paused, &p3_term)) break;
+                if (strcmp(buf, ".\n") == 0) break;
+                safe_write_interruptible(fifo, buf, strlen(buf), &p3_paused, &p3_term, "P3");
+            }
+        } else if (op == 2) {
+            printf("Sciezka: "); fflush(stdout);
+            if (!safe_fgets_interruptible(stdin, buf, sizeof(buf), &p3_paused, &p3_term)) {
+                /* SIGTERM przy podawaniu ścieżki */
+                 if (p3_term) {
+                    fprintf(stderr, "[P3] SIGTERM przy ścieżce -> Wysyłam EXIT.\n");
+                    volatile sig_atomic_t ignore_term_exit = 0;
+                    safe_write_interruptible(fifo, EXIT_TOKEN "\n", strlen(EXIT_TOKEN)+1, &p3_paused, &ignore_term_exit, "P3");
+                    break;
+                 }
+                 continue;
+            }
+            chomp(buf);
+            FILE *f = fopen(buf, "r");
+            if (f) {
+                char fbuf[MAX_LINE];
+                /* Maskowanie SIGTERM podczas wysyłania pliku */
+                volatile sig_atomic_t ignore_term = 0;
+
+                fprintf(stderr, "[P3] Wysyłam plik... (SIGTERM będzie obsłużony PO zakończeniu)\n");
+
+                while (safe_fgets_interruptible(f, fbuf, sizeof(fbuf), &p3_paused, &ignore_term)) {
+                    safe_write_interruptible(fifo, fbuf, strlen(fbuf), &p3_paused, &ignore_term, "P3");
+                    if (strlen(fbuf) > 0 && fbuf[strlen(fbuf)-1] != '\n' && feof(f))
+                        safe_write_interruptible(fifo, "\n", 1, &p3_paused, &ignore_term, "P3");
+                }
+                fclose(f);
+                if (p3_term) fprintf(stderr, "[P3] Plik wysłany. Wykryto SIGTERM.\n");
+
+            } else perror("Błąd pliku");
+        }
+
+        /* Koniec partii - wysyłamy BATCH_END */
+        volatile sig_atomic_t ignore_term_ack = 0;
+        drain_ack_queue();
+        safe_write_interruptible(fifo, BATCH_END_TOKEN "\n", strlen(BATCH_END_TOKEN)+1, &p3_paused, &ignore_term_ack, "P3");
+
+        printf("[P3] Czekam na ACK...\n");
+        ctrl_msg_t ack;
+        while (msgrcv(msq_id, &ack, sizeof(int), ACK_MTYPE, 0) < 0) {
             if (errno == EINTR) {
-                clearerr(f); // Sygnał przerwał czytanie, czyścimy błąd i próbujemy znowu
+                wait_if_paused(&p3_paused, &ignore_term_ack, "P3");
+            } else die("msgrcv ACK");
+        }
+        printf("[P3] Otrzymano ACK.\n");
+
+        /* Sprawdzamy czy był SIGTERM */
+        if (p3_term) {
+            fprintf(stderr, "[P3] Kończę pracę zgodnie z żądaniem SIGTERM (po partii).\n");
+            
+            /* Wysyłamy EXIT_TOKEN, żeby zamknąć P2 i P1 */
+            safe_write_interruptible(fifo, EXIT_TOKEN "\n", strlen(EXIT_TOKEN)+1, &p3_paused, &ignore_term_ack, "P3");
+            
+            /* Czekamy na ACK wyjścia od P1 */
+            while (msgrcv(msq_id, &ack, sizeof(int), ACK_MTYPE, 0) < 0);
+            
+            break;
+        }
+    }
+    close(fifo);
+    exit(0);
+}
+
+/* --- MAIN --- */
+int main(int argc, char **argv) {
+    const char *input_path = (argc >= 2) ? argv[1] : NULL;
+
+    int logfd = open("logs.txt", O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (logfd != -1) {
+        dup2(logfd, STDERR_FILENO);
+        close(logfd);
+    }
+
+    unlink(FIFO_PATH);
+    if (mkfifo(FIFO_PATH, 0666) == -1) die("mkfifo");
+
+    msq_id = msgget(ftok(".", QUEUE_KEY_CHAR), IPC_CREAT | 0666);
+    shm_id = shmget(ftok(".", SHM_KEY_CHAR), sizeof(SharedData), IPC_CREAT | 0666);
+    sem_id = semget(ftok(".", SEM_KEY_CHAR), 2, IPC_CREAT | 0666);
+    
+    if (msq_id == -1 || shm_id == -1 || sem_id == -1) die("IPC init");
+
+    union semun arg;
+    arg.val = 1; semctl(sem_id, SEM_EMPTY, SETVAL, arg);
+    arg.val = 0; semctl(sem_id, SEM_FULL, SETVAL, arg);
+
+    setup_signal_mask();
+
+    struct sigaction sa;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_sigaction = parent_sig_handler;
+    sigaction(SIGTSTP, &sa, NULL);
+    sigaction(SIGCONT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    
+    struct sigaction sa_int;
+    sigemptyset(&sa_int.sa_mask);
+    sa_int.sa_flags = SA_SIGINFO;
+    sa_int.sa_sigaction = parent_sig_handler;
+    sigaction(SIGINT, &sa_int, NULL);
+
+    if ((pid_p1 = fork()) == 0) process_p1();
+    if ((pid_p2 = fork()) == 0) process_p2();
+    if ((pid_p3 = fork()) == 0) process_p3(input_path);
+
+    fprintf(stderr, "[MAIN] Start. P3=%d P2=%d P1=%d.\n", pid_p3, pid_p2, pid_p1);
+    fprintf(stderr, "STEROWANIE: kill -SIGTSTP %d (pauza), kill -SIGTERM %d (koniec)\n", pid_p2, pid_p2);
+
+    int active = 3;
+    while (active > 0) {
+        int st;
+        pid_t w = waitpid(-1, &st, WUNTRACED | WCONTINUED);
+        
+        if (w < 0) {
+            if (errno == EINTR) {
+                if (parent_got_sig) {
+                    int sig = parent_last_sig;
+                    parent_got_sig = 0;
+                    if (sig == SIGINT) sig = SIGTERM;
+
+                    fprintf(stderr, "[MAIN] Sygnał %d -> wysyłam do dzieci\n", sig);
+                    parent_send_control(sig);
+                    
+                    /* Rodzic tylko wysyła sygnał. 
+                       P3 podejmuje decyzję kiedy wysłać EXIT token. */
+                }
                 continue;
             }
-            break; // Prawdziwy koniec pliku lub Ctrl+D
+            perror("waitpid");
+            break;
         }
 
-        // 6. WYSYŁKA DO RURY
-        // P3 wrzuca to, co przeczytał, prosto do pliku fifo (do zmiennej fd).
-        // Wysyła cały bufor (sizeof), żeby P2 zawsze wiedział ile odczytać.
-        // Realizuje wymóg: "przekazuje je w niezmienionej formie do procesu 2"
-        write(fd, bufor, sizeof(bufor));
+        if (WIFSTOPPED(st)) continue;
+        if (WIFCONTINUED(st)) continue;
 
-        // Jeśli tryb interaktywny, wyświetl zachętę ponownie
-        if (zrodlo == NULL) {
-            printf("> ");
-            fflush(stdout);
+        if (WIFEXITED(st) || WIFSIGNALED(st)) {
+            active--;
+            fprintf(stderr, "[MAIN] Potomek %d zakończony.\n", w);
         }
     }
 
-    // 7. SPRZĄTANIE I KONIEC
-    // Zamykamy wejście do rury. To sygnał dla P2: "Koniec transmisji, nic więcej nie będzie".
-    // Gdybyś tego nie zamknął, P2 wisiałby i czekał w nieskończoność.
-    close(fd);
-    if (zrodlo) fclose(f);
-
-    //Kończymy proces P3
-    exit(0);
-}
-
-void wykonaj_p2() {
-    setup_signals();
-    struct WspolnaPamiec *shm = (struct WspolnaPamiec*)shmat(shm_id, NULL, 0);
-
-    int fd;
-    do {
-        fd = open(NAZWA_FIFO, O_RDONLY);
-    } while (fd == -1 && errno == EINTR);
-
-    char bufor[ROZMIAR_BUFORA];
-    while (read(fd, bufor, sizeof(bufor)) > 0) {
-        sem_p(sem_id, 0);
-        strncpy(shm->tekst, bufor, ROZMIAR_BUFORA);
-        shm->ilosc_bajtow = strlen(bufor);
-        shm->czy_koniec = 0;
-        sem_v(sem_id, 1);
-    }
-    sem_p(sem_id, 0);
-    shm->czy_koniec = 1;
-    sem_v(sem_id, 1);
-    shmdt(shm); // Dodane odlaczenie pamięci
-    close(fd);  // Dodane zamkniecie kolejki
-    exit(0);
-}
-
-void wykonaj_p1() {
-    setup_signals(); // Obsługa sygnałów
-
-    // Podłączenie pamięci
-    struct WspolnaPamiec *shm = (struct WspolnaPamiec*)shmat(shm_id, NULL, 0);
-
-    while (1) {
-        // Czekamy na dane od P2 (Semafor 1)
-        sem_p(sem_id, 1);
-
-        // Sprawdzamy flagę końca
-        if (shm->czy_koniec) break;
-
-        // shm->tekst to linia z pliku
-        // shm->ilosc_bajtow to liczba policzona przez P2
-
-        // Sprawdzamy, czy tekst ma enter na końcu, żeby ładnie wyglądało
-        int len = strlen(shm->tekst);
-        if (len > 0 && shm->tekst[len-1] == '\n') {
-            printf("[P1 Otrzymal]: %s [Dlugosc wg P2: %d]\n", shm->tekst, shm->ilosc_bajtow);
-        } else {
-            // Tekst nie ma entera, dodajemy go:
-            printf("[P1 Otrzymal]: %s\n [Dlugosc wg P2: %d]\n", shm->tekst, shm->ilosc_bajtow);
-        }
-
-        fflush(stdout); // Wypychamy na ekran natychmiast
-
-        // Zwalniamy miejsce dla P2 (Semafor 0)
-        sem_v(sem_id, 0);
-    }
-
-    shmdt(shm); // Odłączamy pamięć
-    exit(0); // Kończymy p1
-}
-
-int main(int argc, char *argv[]) {
-    // 1. BUDOWANIE INFRASTRUKTURY (Zasoby IPC)
-    // Tworzymy Pamięć Współdzieloną
-    shm_id = shmget(KLUCZ_SHM, sizeof(struct WspolnaPamiec), 0666 | IPC_CREAT);
-
-    // Tworzymy 3 Semafory (2 do pamięci współdzielonej i jeden dla p3)
-    sem_id = semget(KLUCZ_SEM, 3, 0666 | IPC_CREAT);
-
-    // Tworzymy Kolejkę Komunikatów
-    msg_id = msgget(KLUCZ_MSG, 0666 | IPC_CREAT);
-
-    // 2. USTAWIANIE Semaforów
-    // Semafor 0 = 1 (ZIELONE): "Pamięć jest pusta, P2 może pisać".
-    semctl(sem_id, 0, SETVAL, 1);
-    // Semafor 1 = 0 (CZERWONE): "Pamięć jest pusta, P1 musi czekać".
-    semctl(sem_id, 1, SETVAL, 0);
-    // Semafor 2 = 0 (ZAMKNIĘTY): PM czeka, aż P3 podniesie go po setupie
-    semctl(sem_id, 2, SETVAL, 0);
-
-    // 3. TWORZENIE FIFO
-    // Tworzymy plik specjalny "kolejka_fifo" na dysku (kanał P3 -> P2).
-    mkfifo(NAZWA_FIFO, 0666);
-
-    // Informacja dla uzytkownika o trybie pracy
-    if (argc > 1) {
-        printf("[PM] Uruchamianie w trybie PLIKOWYM. Zrodlo: %s\n", argv[1]);
-    } else {
-        printf("[PM] Brak argumentu (pliku). Uruchamianie w trybie INTERAKTYWNYM (stdin).\n");
-    }
-
-    // 4. Forkowanie
-    // PM klonuje się 3 razy
-    // Realizuje to wymóg: "Wszystkie trzy procesy powinny być powoływane automatycznie z jednego procesu inicjującego".
-
-    if ((p1 = fork()) == 0) wykonaj_p1(); // Dziecko 1 staje się P1
-    if ((p2 = fork()) == 0) wykonaj_p2(); // Dziecko 2 staje się P2
-
-    // Dziecko 3 staje się P3 i dostaje nazwę pliku z argumentów (argv[1])
-    // Jeśli argv[1] istnieje, P3 czyta z pliku. Jeśli nie (NULL), czyta z klawiatury.
-    if ((p3 = fork()) == 0) wykonaj_p3(argc > 1 ? argv[1] : NULL);
-
-    // 5. INICJACJA SCENARIUSZA POWIADAMIANIA
-    // Czekamy na semafor nr 2 od P3
-    sem_p(sem_id, 2);
-
-    // TO JEST KLUCZOWE: PM wysyła pierwszy sygnał do P3.
-    // Realizuje to dokładnie instrukcję z maila: "Proces macierzysty zapisuje wartość sygnału... oraz wysyła powiadomienie do procesu 3".
-    // Bez tego łańcuch sygnałów (PM -> P3 -> P2 -> P1) by nie ruszył.
-    send_status(p3, SIGUSR1);
-
-    // 6. PM czeka, aż wszystkie 3 procesy zakończą pracę (np. po skończeniu pliku).
-    for(int i=0; i<3; i++) wait(NULL);
-
-    // 7. SPRZĄTANIE PO IMPREZIE
-    // Usuwamy pamięć, semafory i kolejkę wiadomości
+    msgctl(msq_id, IPC_RMID, NULL);
     shmctl(shm_id, IPC_RMID, NULL);
     semctl(sem_id, 0, IPC_RMID);
-    msgctl(msg_id, IPC_RMID, NULL);
-
-    // Usuwamy plik rury z dysku.
-    unlink(NAZWA_FIFO);
-    printf("[PM] Koniec pracy systemu.\n");
-
+    unlink(FIFO_PATH);
+    fprintf(stderr, "[MAIN] Bye.\n");
     return 0;
 }
